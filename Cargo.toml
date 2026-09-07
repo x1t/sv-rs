@@ -1,0 +1,23 @@
+[package]
+name = "sv-rs"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+# 对齐 Go 版 `-ldflags="-s -w"`:去除符号并开启薄 LTO,产出更小、更快、更确定的静态二进制。
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+base64 = "0.23.1"
+quick-xml = "0.42.0"
+unicode-width = "0.2.2"
+ureq = "3.4.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+tempfile = "3.27.0"

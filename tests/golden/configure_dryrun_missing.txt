@@ -1,0 +1,1 @@
+将更新 /tmp/svgolden/cfg_missing/supervisord.conf，新增配置段: inet_http_server, rpcinterface:supervisor

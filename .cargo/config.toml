@@ -1,0 +1,11 @@
+# musl 静态交叉编译配置。
+#
+# 背景:zig lld 会把「忽略已弃用的链接器优化选项」这类提示写到 stderr,
+# 自 Rust 1.97 起被 `linker_messages` lint 镜像成 warning(官方 release notes 中
+# 的原例正是该提示)。它无害——仅表示 zig 忽略了 -Wl,-O1 之类的链接优化——且真实
+# 链接错误仍是硬错误。因此只在这两个 musl 静态目标上放行该 lint,宿主 gnu 目标不受影响。
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-A", "linker_messages"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-A", "linker_messages"]

@@ -1,0 +1,1 @@
+RPC配置已存在: /tmp/svgolden/cfg_ok/supervisord.conf
