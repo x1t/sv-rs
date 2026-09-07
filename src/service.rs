@@ -191,6 +191,17 @@ impl ServiceManager {
                 write_line(out, "服务未安装，无需卸载")
             }
         } else {
+            // 归属门控:仅当服务文件里记录的可执行路径确为本工具安装(等于当前 sv,
+            // 或等于命令软链当前指向的路径,覆盖升级换路径/旧 exe 已删除)才卸载;
+            // 否则是占用本服务名的异源文件,拒绝 stop/disable/删除,避免误伤。
+            let recorded = self.recorded_executable().unwrap_or_default();
+            if !self.service_file_owned(&recorded) {
+                let file = match self.backend {
+                    ServiceBackend::Systemd => self.unit_path.display().to_string(),
+                    ServiceBackend::SysV => self.init_script_path.display().to_string(),
+                };
+                return Err(format!("拒绝卸载非本程序注册的服务文件: {file}"));
+            }
             // 先记录服务文件里的可执行路径,再删除服务文件,供命令软链归属判定。
             let owned = self.uninstall_symlink_owned();
             match self.backend {
@@ -259,13 +270,21 @@ impl ServiceManager {
     fn status(&self, out: &mut dyn Write) -> Result<(), String> {
         let status = match self.backend {
             ServiceBackend::Systemd => {
-                let active = self
-                    .run_systemctl(&["is-active", &self.unit_file_name()])
-                    .map_err(|e| format!("获取服务状态失败: {e}"))?;
-                match active.trim() {
-                    "active" => ServiceStatus::Running,
-                    "inactive" => ServiceStatus::Stopped,
-                    _ => ServiceStatus::Unknown,
+                let outcome = run_command(
+                    "systemctl",
+                    &[String::from("is-active"), self.unit_file_name()],
+                    Duration::from_secs(15),
+                )
+                .map_err(|e| format!("获取服务状态失败: {e}"))?;
+                // is-active 对非 active 态(含 inactive/failed/未加载)返回非零退出码,
+                // 需按输出文本而非退出码判定,避免「已停止」被误报为错误。
+                match outcome.code {
+                    Some(_) => match outcome.combined_text().trim() {
+                        "active" => ServiceStatus::Running,
+                        "inactive" => ServiceStatus::Stopped,
+                        _ => ServiceStatus::Unknown,
+                    },
+                    None => return Err("获取服务状态失败: signal: killed".to_string()),
                 }
             }
             ServiceBackend::SysV => {

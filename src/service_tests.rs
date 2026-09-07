@@ -210,7 +210,12 @@ fn test_uninstall_stops_sysv_service_before_removal() {
     let (dir, manager, symlink) = temp_manager(ServiceBackend::SysV);
     fs::create_dir_all(manager.init_script_path.parent().unwrap()).unwrap();
     let marker = dir.path().join("stop-called");
-    let script = format!("#!/bin/sh\nprintf stopped > {}\n", shell_quote(&marker));
+    // 脚本需带 exe= 记录并指向本 sv,才会被归属门控放行到 stop 阶段。
+    let script = format!(
+        "#!/bin/sh\nexe='{}'\ncase \"$1\" in\nstop)\nprintf stopped > {}\nexit 0\n;;\nesac\nexit 0\n",
+        manager.executable,
+        shell_quote(&marker)
+    );
     fs::write(&manager.init_script_path, script).unwrap();
     fs::set_permissions(
         &manager.init_script_path,
@@ -397,4 +402,91 @@ fn test_uninstall_cleans_leftover_command_symlink_only() {
     assert!(symlink.symlink_metadata().is_err(), "残留软链应被清理");
     let text = String::from_utf8_lossy(&out);
     assert!(text.contains("已清理残留"), "{text}");
+}
+
+#[test]
+fn test_sysv_status_stopped_reports_stopped() {
+    // 真实 init 脚本 status 返回 code 3(not running),status 应输出「已停止」而非报错。
+    let (_dir, manager, _) = temp_manager(ServiceBackend::SysV);
+    manager.write_init_script().unwrap();
+    let mut out = Vec::new();
+    manager.status(capture(&mut out)).unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("SV 系统服务状态: ⏸️ 已停止"), "{text}");
+}
+
+#[test]
+fn test_uninstall_refuses_foreign_sysv_script() {
+    let (dir, manager, symlink) = temp_manager(ServiceBackend::SysV);
+    let marker = dir.path().join("foreign-ran");
+    let script = format!(
+        "#!/bin/sh\nexe='/usr/bin/not-sv'\necho foreign > {}\nexit 0\n",
+        shell_quote(&marker)
+    );
+    fs::create_dir_all(manager.init_script_path.parent().unwrap()).unwrap();
+    fs::write(&manager.init_script_path, script).unwrap();
+    fs::set_permissions(
+        &manager.init_script_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    // 命令软链仍指向本 sv,证明 init 脚本本身是异源的。
+    make_symlink(Path::new(&manager.executable), &symlink).unwrap();
+
+    let mut out = Vec::new();
+    let error = manager.uninstall(capture(&mut out)).unwrap_err();
+    assert!(error.contains("拒绝卸载非本程序注册的服务文件"), "{error}");
+    assert!(manager.init_script_path.exists(), "异源脚本不应被删除");
+    assert!(!marker.exists(), "不应执行异源脚本(未调 stop)");
+    assert!(
+        symlink.symlink_metadata().unwrap().file_type().is_symlink(),
+        "本 sv 软链不受影响"
+    );
+}
+
+#[test]
+fn test_uninstall_refuses_foreign_systemd_unit() {
+    // ExecStart 指向非本 sv 路径 → 视作异源 unit,门控应在任何 systemctl 之前拦下。
+    let (_dir, manager, _) = temp_manager(ServiceBackend::Systemd);
+    fs::create_dir_all(manager.unit_path.parent().unwrap()).unwrap();
+    fs::write(&manager.unit_path, systemd_unit_text("/usr/bin/not-sv")).unwrap();
+
+    let mut out = Vec::new();
+    let error = manager.uninstall(capture(&mut out)).unwrap_err();
+    assert!(error.contains("拒绝卸载非本程序注册的服务文件"), "{error}");
+    assert!(manager.unit_path.exists(), "异源 unit 不应被删除");
+}
+
+#[test]
+fn test_service_file_owned_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let executable = real_executable(dir.path());
+    let symlink = dir.path().join("bin").join("sv");
+    fs::create_dir_all(symlink.parent().unwrap()).unwrap();
+    let manager = ServiceManager::for_testing(
+        executable.clone(),
+        symlink.clone(),
+        dir.path().join("unit.service"),
+        dir.path().join("init"),
+        ServiceBackend::SysV,
+    );
+
+    // 记录路径 == 当前 exe → 归属。
+    assert!(manager.service_file_owned(&executable));
+    // 记录为空 → 不归属。
+    assert!(!manager.service_file_owned(""));
+    // 异源且无软链佐证 → 不归属。
+    assert!(!manager.service_file_owned("/usr/bin/not-sv"));
+
+    // 软链指向记录路径(记录 != 当前,旧 exe 不存在即 dangling)→ 归属。
+    let recorded = dir.path().join("old").join("sv");
+    make_symlink(&recorded, &symlink).unwrap();
+    assert!(manager.service_file_owned(&recorded.to_string_lossy()));
+    assert!(!manager.service_file_owned("/usr/bin/other"));
+
+    // 软链被普通文件占用时,不再作佐证,仅当前 exe 匹配成立。
+    fs::remove_file(&symlink).unwrap();
+    fs::write(&symlink, "occupied").unwrap();
+    assert!(manager.service_file_owned(&executable));
+    assert!(!manager.service_file_owned(&recorded.to_string_lossy()));
 }

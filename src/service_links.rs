@@ -121,6 +121,26 @@ impl ServiceManager {
         }
     }
 
+    /// 判断服务注册文件是否为 sv 安装的资产(防止 uninstall 误删占用本服务名的
+    /// 异源文件)。归属证据二选一:记录的可执行路径等于当前 sv(含升级后仍用同一
+    /// 路径的情形),或等于命令软链当前指向的路径(覆盖升级换路径/旧 exe 已删除,
+    /// 软链 readlink 原文匹配即可,允许 dangling)。
+    pub(crate) fn service_file_owned(&self, recorded: &str) -> bool {
+        if recorded.is_empty() {
+            return false;
+        }
+        let recorded = clean_path(Path::new(recorded));
+        if !self.executable.is_empty() && clean_path(Path::new(&self.executable)) == recorded {
+            return true;
+        }
+        match fs::symlink_metadata(&self.symlink_path) {
+            Ok(info) if info.file_type().is_symlink() => fs::read_link(&self.symlink_path)
+                .map(|target| resolve_link_target(&self.symlink_path, &target) == recorded)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     fn require_executable(&self) -> Result<(), String> {
         if !self.executable.is_empty() {
             return Ok(());
