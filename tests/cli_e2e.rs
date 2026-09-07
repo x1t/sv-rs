@@ -216,14 +216,6 @@ fn e2e_list_with_extra_args_matches_golden() {
 }
 
 #[test]
-fn e2e_daemon_with_extra_args_matches_golden() {
-    let output = run_bin(&["daemon", "extra"]);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert_eq!(output.stderr, golden("err_daemon_extra.txt"));
-}
-
-#[test]
 fn e2e_service_command_argument_errors() {
     let output = run_bin(&["service", "install", "extra"]);
     assert_eq!(output.status.code(), Some(1));

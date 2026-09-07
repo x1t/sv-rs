@@ -1,20 +1,12 @@
-//! systemd / SysV 服务资产:后端探测、unit 与 init 脚本文本、软链接原语、
-//! 信号等待。均为纯函数或系统探测,不触碰落地目录,便于独立测试。
+//! 旧版 systemd / SysV 服务资产的解析与清理原语。
+//!
+//! sv-rs 不再安装或运行自身服务;这些函数只服务于兼容卸载,不主动触碰系统路径。
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-use crate::util::command_available;
-
-/// 服务标识(镜像 Go `serviceName`)。
+/// 旧版服务标识(镜像 Go `serviceName`)。
 pub const SERVICE_NAME: &str = "sv-supervisor-manager";
-
-/// 创建符号链接(Linux 原生实现)。
-pub fn make_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
 
 const SYSV_START_RUNLEVELS: [&str; 4] = ["2", "3", "4", "5"];
 const SYSV_STOP_RUNLEVELS: [&str; 3] = ["0", "1", "6"];
@@ -36,15 +28,13 @@ pub fn sysv_runlevel_link_paths(init_script: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// 清理指向指定 init 脚本的 SysV runlevel 链接。
+/// 校验并收集指向指定 init 脚本的现有 SysV runlevel 链接。
 ///
-/// 只移除目标完全匹配的符号链接,并在发现外部路径时先整体拒绝,避免部分清理。
-pub fn remove_sysv_runlevel_links(init_script: &Path) -> Result<(), String> {
-    let paths = sysv_runlevel_link_paths(init_script);
-
+/// 缺失链接允许存在,但任何普通文件或异源软链接都会整体拒绝,避免误删。
+fn collect_sysv_runlevel_links(init_script: &Path) -> Result<Vec<PathBuf>, String> {
     let expected = clean_path(init_script);
-    let mut removable = Vec::with_capacity(paths.len());
-    for path in paths {
+    let mut removable = Vec::new();
+    for path in sysv_runlevel_link_paths(init_script) {
         let info = match fs::symlink_metadata(&path) {
             Ok(info) => info,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -68,12 +58,69 @@ pub fn remove_sysv_runlevel_links(init_script: &Path) -> Result<(), String> {
         }
         removable.push(path);
     }
-    for path in removable {
+    Ok(removable)
+}
+
+/// 仅校验现有 SysV 链接归属,允许旧安装缺失部分链接。
+pub fn validate_sysv_runlevel_links(init_script: &Path) -> Result<(), String> {
+    collect_sysv_runlevel_links(init_script).map(|_| ())
+}
+
+/// 清理指向指定 init 脚本的 SysV runlevel 链接。
+pub fn remove_sysv_runlevel_links(init_script: &Path) -> Result<(), String> {
+    for path in collect_sysv_runlevel_links(init_script)? {
         fs::remove_file(&path).map_err(|error| format!("删除 SysV 启动链接失败: {error}"))?;
     }
     Ok(())
 }
 
+/// 返回 systemd unit 对应的 multi-user.target enable 链接路径。
+pub fn systemd_enable_link_path(unit_path: &Path) -> Option<PathBuf> {
+    let directory = unit_path.parent()?;
+    let name = unit_path.file_name()?;
+    Some(directory.join("multi-user.target.wants").join(name))
+}
+
+/// 校验 systemd enable 链接是否存在且明确指向指定 unit。
+pub fn validate_systemd_enable_link(unit_path: &Path) -> Result<bool, String> {
+    let Some(link) = systemd_enable_link_path(unit_path) else {
+        return Ok(false);
+    };
+    let info = match fs::symlink_metadata(&link) {
+        Ok(info) => info,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("检查 systemd enable 链接失败: {error}")),
+    };
+    if !info.file_type().is_symlink() {
+        return Err(format!("拒绝删除非软链接路径: {}", link.display()));
+    }
+    let target =
+        fs::read_link(&link).map_err(|error| format!("读取 systemd enable 链接失败: {error}"))?;
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        link.parent().unwrap_or(Path::new(".")).join(target)
+    };
+    if clean_path(&resolved) != clean_path(unit_path) {
+        return Err(format!(
+            "拒绝删除指向其他文件的 systemd enable 链接: {}",
+            link.display()
+        ));
+    }
+    Ok(true)
+}
+
+/// 删除明确属于指定 unit 的 systemd enable 链接。
+pub fn remove_systemd_enable_link(unit_path: &Path) -> Result<bool, String> {
+    if !validate_systemd_enable_link(unit_path)? {
+        return Ok(false);
+    }
+    let link = systemd_enable_link_path(unit_path).ok_or("systemd enable 链接路径缺失")?;
+    fs::remove_file(&link).map_err(|error| format!("删除 systemd enable 链接失败: {error}"))?;
+    Ok(true)
+}
+
+/// 对绝对路径做不跟随软链的词法规范化。
 pub fn clean_path(path: &Path) -> PathBuf {
     let mut cleaned = PathBuf::new();
     for component in path.components() {
@@ -88,18 +135,17 @@ pub fn clean_path(path: &Path) -> PathBuf {
     cleaned
 }
 
-/// systemd unit 里 ExecStart 可执行路径的转义:空格写作 \x20,避免被当作参数分隔。
+/// systemd unit 里 ExecStart 可执行路径的转义:空格写作 \x20。
 fn systemd_escape_executable(executable: &str) -> String {
     executable.replace(' ', r"\x20")
 }
 
-/// shell 单引号转义,供 SysV 脚本内嵌可执行路径使用。
+/// shell 单引号转义,用于解析旧版 SysV init 脚本中的可执行路径。
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// 从 systemd unit 文本解析回 ExecStart 的可执行路径(把 \x20 还原为空格)。
-/// 只接受无前缀、绝对路径的第一段;解析不到返回 None。
+/// 从旧版 systemd unit 文本解析回 ExecStart 的可执行路径。
 pub fn systemd_unit_executable(text: &str) -> Option<String> {
     let line = text
         .lines()
@@ -113,9 +159,7 @@ pub fn systemd_unit_executable(text: &str) -> Option<String> {
     Some(first.replace(r"\x20", " "))
 }
 
-/// 从 SysV init 脚本文本解析回 exe 记录的单引号值(反转 shell_quote)。
-/// shell_quote 把值里的 ' 编码为 '\'';整行以单引号开头结尾,剥掉外层后再把
-/// '\'' 还原为 ' 即得原值。只接受单引号包裹且非空的行;解析不到返回 None。
+/// 从旧版 SysV init 脚本文本解析回 exe 记录的单引号值。
 pub fn sysv_init_executable(text: &str) -> Option<String> {
     let line = text
         .lines()
@@ -132,100 +176,19 @@ pub fn sysv_init_executable(text: &str) -> Option<String> {
     Some(unquoted)
 }
 
-/// 创建指向指定 init 脚本的 SysV runlevel 链接(与 Go 依赖库的 S50/K02 命名一致)。
-/// 已存在且指向本脚本时视为成功;占用为普通文件或指向其他目标时拒绝,避免覆盖。
-/// 任何一步失败都会回滚本次已创建的链接,不留半成品。
-pub fn create_sysv_runlevel_links(init_script: &Path) -> Result<(), String> {
-    let root = init_script
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| "init.d目录缺失".to_string())?;
-    let mut links = Vec::with_capacity(SYSV_START_RUNLEVELS.len() + SYSV_STOP_RUNLEVELS.len());
-    for runlevel in SYSV_START_RUNLEVELS {
-        links.push(root.join(format!("rc{runlevel}.d/S50{SERVICE_NAME}")));
-    }
-    for runlevel in SYSV_STOP_RUNLEVELS {
-        links.push(root.join(format!("rc{runlevel}.d/K02{SERVICE_NAME}")));
-    }
-
-    let expected = clean_path(init_script);
-    let mut created = Vec::with_capacity(links.len());
-    let result = create_sysv_runlevel_links_inner(&links, init_script, &expected, &mut created);
-    if result.is_err() {
-        for link in created {
-            let _ = fs::remove_file(link);
-        }
-    }
-    result
-}
-
-fn create_sysv_runlevel_links_inner(
-    links: &[PathBuf],
-    init_script: &Path,
-    expected: &Path,
-    created: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    for link in links {
-        match fs::symlink_metadata(link) {
-            Ok(info) => {
-                if !info.file_type().is_symlink() {
-                    return Err(format!("目标路径已存在且不是软链接: {}", link.display()));
-                }
-                let target = fs::read_link(link)
-                    .map_err(|error| format!("读取 SysV 启动链接失败: {error}"))?;
-                let resolved = if target.is_absolute() {
-                    target
-                } else {
-                    link.parent().unwrap_or(Path::new(".")).join(target)
-                };
-                if clean_path(&resolved) != expected {
-                    return Err(format!(
-                        "目标软链接已存在且指向其他文件: {}",
-                        link.display()
-                    ));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = link.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| format!("创建 SysV 启动链接目录失败: {error}"))?;
-                }
-                make_symlink(init_script, link)
-                    .map_err(|error| format!("创建 SysV 启动链接失败: {error}"))?;
-                created.push(link.clone());
-            }
-            Err(error) => return Err(format!("检查 SysV 启动链接失败: {error}")),
-        }
-    }
-    Ok(())
-}
-
-/// 可用的服务后端。
+/// 旧版服务后端,仅用于卸载时遍历已知资产。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ServiceBackend {
     Systemd,
     SysV,
 }
 
-/// 服务运行状态(镜像 Go `service.Status`)。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ServiceStatus {
-    Running,
-    Stopped,
-    Unknown,
-}
-
-/// 探测当前后端:systemd 活跃且 systemctl 可用时为 Systemd,否则 SysV。
-pub fn detect_backend() -> ServiceBackend {
-    let systemd_running = Path::new("/run/systemd/system").exists()
+/// 判断当前系统是否由 systemd 作为服务管理器运行。
+pub fn systemd_runtime_active() -> bool {
+    Path::new("/run/systemd/system").exists()
         || fs::read_to_string("/proc/1/comm")
             .map(|name| name.trim() == "systemd")
-            .unwrap_or(false);
-    if systemd_running && command_available("systemctl") {
-        ServiceBackend::Systemd
-    } else {
-        ServiceBackend::SysV
-    }
+            .unwrap_or(false)
 }
 
 /// 解析当前可执行文件的绝对路径;失败时返回空串。
@@ -237,7 +200,7 @@ pub fn resolve_own_executable() -> String {
         .unwrap_or_default()
 }
 
-/// systemd unit 文件内容。
+/// 旧版 systemd unit 模板,仅用于卸载时确认资产归属。
 pub fn systemd_unit_text(executable: &str) -> String {
     format!(
         "[Unit]\nDescription=SV Supervisor Manager\nAfter=network.target\n\n\
@@ -247,7 +210,7 @@ pub fn systemd_unit_text(executable: &str) -> String {
     )
 }
 
-/// SysV init.d 脚本内容。
+/// 旧版 SysV init 脚本模板,仅用于卸载时确认资产归属。
 pub fn sysv_init_text(executable: &str) -> String {
     format!(
         "#!/bin/sh\n\
@@ -300,53 +263,14 @@ case \"$1\" in\n\
     fi\n\
     echo \"not running\"\n\
     exit 3\n\
-    ;;\n\
+  ;;\
   *)\n\
     echo \"Usage: $0 {{start|stop|restart|status}}\" >&2\n\
     exit 1\n\
-    ;;\n\
+  ;;\n\
 esac\n",
         shell_quote(executable)
     )
-}
-
-#[cfg(test)]
-mod text_tests {
-    use super::*;
-
-    #[test]
-    fn test_systemd_unit_escapes_space_in_executable() {
-        let text = systemd_unit_text("/opt/my app/sv-rs");
-        assert!(
-            text.contains("ExecStart=/opt/my\\x20app/sv-rs daemon"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn test_sysv_init_quotes_executable() {
-        let text = sysv_init_text("/opt/my app/sv'rs");
-        assert!(text.contains("exe='/opt/my app/sv'\\''rs'"), "{text}");
-    }
-}
-
-/// 等待 SIGTERM/SIGINT;收到信号后返回。供守护进程优雅退出。
-pub fn wait_for_signal() -> Result<(), String> {
-    static STOP: AtomicBool = AtomicBool::new(false);
-    extern "C" fn on_signal(_signal: i32) {
-        STOP.store(true, Ordering::SeqCst);
-    }
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-            libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
-        }
-    }
-    while !STOP.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
