@@ -28,7 +28,8 @@ sv-rs/
 │   ├── render.rs        # 确定性表格渲染(对齐 golden)
 │   ├── parse.rs         # 进程数据模型与纯文本解析
 │   ├── service.rs       # Linux 系统服务管理(systemd/SysV)
-│   ├── service_files.rs # 服务资产文本、软链接、信号等待
+│   ├── service_links.rs # 命令软链接的创建/归属删除
+│   ├── service_files.rs # 服务资产文本、runlevel 链接、信号等待
 │   ├── spec.rs          # 动作/参数校验
 │   ├── util.rs          # 命令执行等工具
 │   └── xmlrpc.rs        # XML-RPC 编解码
@@ -96,7 +97,7 @@ export SUPERVISOR_TIMEOUT="300"
 ```bash
 cargo fmt --all -- --check   # 格式检查
 cargo clippy --all-targets -- -D warnings   # 零警告
-cargo test                   # 78 项:65 单元 + 13 golden 端到端(真实 HTTP 服务端)
+cargo test                   # 103 项:90 单元 + 13 golden 端到端(真实 HTTP 服务端)
 ```
 
 golden 测试把编译产物作为真实进程运行,喂以真实本地 HTTP XML-RPC 服务端,

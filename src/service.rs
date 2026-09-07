@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::service_files::{
-    SERVICE_NAME, ServiceBackend, ServiceStatus, detect_backend, make_symlink,
-    resolve_own_executable, systemd_unit_text, sysv_init_text, wait_for_signal,
+    SERVICE_NAME, ServiceBackend, ServiceStatus, clean_path, create_sysv_runlevel_links,
+    detect_backend, remove_sysv_runlevel_links, resolve_own_executable, systemd_unit_text,
+    sysv_init_text, sysv_runlevel_link_paths, wait_for_signal,
 };
 use crate::util::{io_context, run_command};
 
@@ -18,13 +19,20 @@ const SYMLINK_DEFAULT: &str = "/usr/local/bin/sv";
 const SYSTEMD_DIR_DEFAULT: &str = "/etc/systemd/system";
 const INIT_DIR_DEFAULT: &str = "/etc/init.d";
 
+/// 安装过程中创建的落地资产,用于失败回滚。
+enum ServiceAsset {
+    Unit(PathBuf),
+    Init(PathBuf),
+}
+
 /// 服务管理器:持有可执行文件、软链接与后端的落地路径。
+/// 字段以 pub(crate) 暴露,供同 crate 的 service_links 扩展 impl 使用。
 pub struct ServiceManager {
-    executable: String,
-    symlink_path: PathBuf,
-    unit_path: PathBuf,
-    init_script_path: PathBuf,
-    backend: ServiceBackend,
+    pub(crate) executable: String,
+    pub(crate) symlink_path: PathBuf,
+    pub(crate) unit_path: PathBuf,
+    pub(crate) init_script_path: PathBuf,
+    pub(crate) backend: ServiceBackend,
 }
 
 impl ServiceManager {
@@ -81,47 +89,149 @@ impl ServiceManager {
         }
     }
 
-    /// 安装系统服务并创建命令软链接。
+    /// 安装系统服务并创建命令软链接。任何已存在的服务文件或软链接都会拒绝覆盖。
     fn install(&self, out: &mut dyn Write) -> Result<(), String> {
         write_line(out, "🔧 正在安装 SV 系统服务...")?;
+        let mut created_assets = Vec::new();
         match self.backend {
             ServiceBackend::Systemd => {
                 self.write_unit_file()
                     .map_err(|e| format!("安装服务失败: {e}"))?;
-                let _ = self.run_systemctl(&["daemon-reload"]);
-                self.run_systemctl(&["enable", &self.unit_file_name()])
-                    .map_err(|e| format!("安装服务失败: {e}"))?;
+                created_assets.push(ServiceAsset::Unit(self.unit_path.clone()));
+                if let Err(error) = self.run_systemctl(&["daemon-reload"]) {
+                    self.rollback_assets(&created_assets);
+                    return Err(format!("安装服务失败: {error}"));
+                }
+                if let Err(error) = self.run_systemctl(&["enable", &self.unit_file_name()]) {
+                    self.rollback_assets(&created_assets);
+                    return Err(format!("安装服务失败: {error}"));
+                }
             }
             ServiceBackend::SysV => {
                 self.write_init_script()
                     .map_err(|e| format!("安装服务失败: {e}"))?;
+                created_assets.push(ServiceAsset::Init(self.init_script_path.clone()));
+                if let Err(error) = create_sysv_runlevel_links(&self.init_script_path) {
+                    self.rollback_assets(&created_assets);
+                    return Err(format!("安装服务失败: {error}"));
+                }
             }
         }
-        self.create_symlink(out)
-            .map_err(|e| format!("服务已安装，但创建命令软链接失败: {e}"))?;
-        write_line(out, "✅ SV 系统服务安装成功")
+        match self.create_symlink(out) {
+            Ok(()) => write_line(out, "✅ SV 系统服务安装成功"),
+            Err(error) => {
+                self.rollback_assets(&created_assets);
+                Err(format!("服务已安装，但创建命令软链接失败: {error}"))
+            }
+        }
+    }
+
+    /// 回滚本次安装已创建的服务资产(不触碰先前已存在的路径)。
+    /// systemd 需先 disable(清除 .wants 链接)、删除 unit 后再 daemon-reload,
+    /// 才能与 uninstall 一致地恢复原状;SysV 需清理 runlevel 链接与脚本。
+    fn rollback_assets(&self, created: &[ServiceAsset]) {
+        if self.backend == ServiceBackend::Systemd {
+            let _ = self.run_systemctl(&["disable", &self.unit_file_name()]);
+        }
+        for asset in created {
+            match asset {
+                ServiceAsset::Unit(path) | ServiceAsset::Init(path) => {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+        if self.backend == ServiceBackend::SysV {
+            let _ = remove_sysv_runlevel_links(&self.init_script_path);
+        }
+        if self.backend == ServiceBackend::Systemd {
+            let _ = self.run_systemctl(&["daemon-reload"]);
+        }
+        // 回滚只清理本次创建的软链:以当前可执行路径为候选,指向他处的一律不动。
+        let candidates = if self.executable.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.executable.clone()]
+        };
+        let _ = self.remove_symlink(&mut std::io::sink(), &candidates);
     }
 
     /// 卸载系统服务并移除本程序创建的软链接。
+    ///
+    /// 幂等:服务本就未安装(unit/init 均不存在)时,若有残留命令软链则尽力清理,
+    /// 否则输出「服务未安装,无需卸载」并返回成功。
     fn uninstall(&self, out: &mut dyn Write) -> Result<(), String> {
-        match self.backend {
-            ServiceBackend::Systemd => {
-                let _ = self.run_systemctl(&["disable", &self.unit_file_name()]);
-                if self.unit_path.exists() {
-                    fs::remove_file(&self.unit_path).map_err(|e| io_context("卸载服务失败", e))?;
-                }
-                let _ = self.run_systemctl(&["daemon-reload"]);
+        let service_file_present = match self.backend {
+            ServiceBackend::Systemd => path_lstat(&self.unit_path).is_some(),
+            ServiceBackend::SysV => path_lstat(&self.init_script_path).is_some(),
+        };
+
+        if !service_file_present {
+            // 未注册:仍清理本程序可能残留的 rc 启停链接与命令软链;全无则 no-op。
+            let mut cleaned_anything = false;
+            if self.backend == ServiceBackend::SysV
+                && sysv_runlevel_link_paths(&self.init_script_path)
+                    .iter()
+                    .any(|link| path_lstat(link).is_some())
+                && remove_sysv_runlevel_links(&self.init_script_path).is_ok()
+            {
+                cleaned_anything = true;
             }
-            ServiceBackend::SysV => {
-                if self.init_script_path.exists() {
-                    fs::remove_file(&self.init_script_path)
-                        .map_err(|e| io_context("卸载服务失败", e))?;
+            let owned = self.uninstall_symlink_owned();
+            match fs::symlink_metadata(&self.symlink_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_context("检查软链接", error)),
+                Ok(_) => {
+                    self.remove_symlink(out, &owned)?;
+                    cleaned_anything = true;
                 }
             }
+            if cleaned_anything {
+                write_line(out, "✅ 服务未安装，已清理残留文件/软链接")
+            } else {
+                write_line(out, "服务未安装，无需卸载")
+            }
+        } else {
+            // 先记录服务文件里的可执行路径,再删除服务文件,供命令软链归属判定。
+            let owned = self.uninstall_symlink_owned();
+            match self.backend {
+                ServiceBackend::Systemd => {
+                    self.run_systemctl(&["stop", &self.unit_file_name()])
+                        .map_err(|e| format!("卸载服务失败: {e}"))?;
+                    self.run_systemctl(&["disable", &self.unit_file_name()])
+                        .map_err(|e| format!("卸载服务失败: {e}"))?;
+                    if let Some(info) = path_lstat(&self.unit_path) {
+                        if info.is_dir() {
+                            return Err(format!("拒绝删除目录: {}", self.unit_path.display()));
+                        }
+                        fs::remove_file(&self.unit_path)
+                            .map_err(|e| io_context("卸载服务失败", e))?;
+                    }
+                    self.run_systemctl(&["daemon-reload"])
+                        .map_err(|e| format!("卸载服务失败: {e}"))?;
+                }
+                ServiceBackend::SysV => {
+                    if path_lstat(&self.init_script_path).is_some() {
+                        self.service_control("stop")
+                            .map_err(|e| format!("卸载服务失败: {e}"))?;
+                    }
+                    remove_sysv_runlevel_links(&self.init_script_path)
+                        .map_err(|e| format!("卸载服务失败: {e}"))?;
+                    if let Some(info) = path_lstat(&self.init_script_path) {
+                        if info.is_dir() {
+                            return Err(format!(
+                                "拒绝删除目录: {}",
+                                self.init_script_path.display()
+                            ));
+                        }
+                        fs::remove_file(&self.init_script_path)
+                            .map_err(|e| io_context("卸载服务失败", e))?;
+                    }
+                }
+            }
+            self.remove_symlink(out, &owned)
+                .map_err(|e| format!("服务已卸载，但移除命令软链接失败: {e}"))?;
+            write_line(out, "✅ SV 系统服务卸载成功")
         }
-        self.remove_symlink(out)
-            .map_err(|e| format!("服务已卸载，但移除命令软链接失败: {e}"))?;
-        write_line(out, "✅ SV 系统服务卸载成功")
     }
 
     /// 启动系统服务。
@@ -198,7 +308,17 @@ impl ServiceManager {
             .unwrap_or_else(|| format!("{SERVICE_NAME}.service"))
     }
 
+    /// 拒绝写入已存在的路径(含软链接),避免覆盖既有服务文件或跟随软链接写向别处。
+    fn ensure_absent(path: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_context("检查目标路径", error)),
+            Ok(_) => Err(format!("目标路径已存在: {}", path.display())),
+        }
+    }
+
     fn write_unit_file(&self) -> Result<(), String> {
+        Self::ensure_absent(&self.unit_path)?;
         let directory = self.unit_path.parent().ok_or("unit目录缺失")?;
         fs::create_dir_all(directory).map_err(|e| io_context("创建服务目录", e))?;
         let content = systemd_unit_text(&self.executable);
@@ -206,6 +326,7 @@ impl ServiceManager {
     }
 
     fn write_init_script(&self) -> Result<(), String> {
+        Self::ensure_absent(&self.init_script_path)?;
         let directory = self.init_script_path.parent().ok_or("init.d目录缺失")?;
         fs::create_dir_all(directory).map_err(|e| io_context("创建服务目录", e))?;
         let content = sysv_init_text(&self.executable);
@@ -254,96 +375,14 @@ impl ServiceManager {
             }
         }
     }
+}
 
-    /// 创建命令软链接(镜像 Go `createSymlink`)。
-    fn create_symlink(&self, out: &mut dyn Write) -> Result<(), String> {
-        self.require_executable()?;
-        let directory = self
-            .symlink_path
-            .parent()
-            .ok_or_else(|| "软链接路径不能为空".to_string())?;
-        fs::create_dir_all(directory).map_err(|e| io_context("创建软链接目录", e))?;
-
-        match fs::symlink_metadata(&self.symlink_path) {
-            Ok(info) => {
-                if !info.file_type().is_symlink() {
-                    return Err(format!(
-                        "目标路径已存在且不是软链接: {}",
-                        self.symlink_path.display()
-                    ));
-                }
-                let resolved_target = fs::canonicalize(&self.symlink_path).ok();
-                let resolved_executable = fs::canonicalize(&self.executable).ok();
-                if resolved_target == resolved_executable {
-                    return Ok(());
-                }
-                Err(format!(
-                    "目标软链接已存在且指向其他文件: {}",
-                    self.symlink_path.display()
-                ))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                make_symlink(Path::new(&self.executable), &self.symlink_path)
-                    .map_err(|e| io_context("创建软链接", e))?;
-                write_line(
-                    out,
-                    &format!(
-                        "🔗 已创建软链接: {} -> {}",
-                        self.symlink_path.display(),
-                        self.executable
-                    ),
-                )
-            }
-            Err(error) => Err(io_context("检查软链接目标", error)),
-        }
-    }
-
-    /// 移除由本程序创建的软链接(镜像 Go `removeSymlink`)。
-    fn remove_symlink(&self, out: &mut dyn Write) -> Result<(), String> {
-        self.require_executable()?;
-        match fs::symlink_metadata(&self.symlink_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io_context("检查软链接", error)),
-            Ok(info) => {
-                if !info.file_type().is_symlink() {
-                    return Err(format!(
-                        "拒绝删除非软链接路径: {}",
-                        self.symlink_path.display()
-                    ));
-                }
-                let resolved_target = fs::canonicalize(&self.symlink_path)
-                    .map_err(|e| io_context("解析软链接", e))?;
-                let resolved_executable = fs::canonicalize(&self.executable)
-                    .map_err(|e| io_context("解析可执行文件", e))?;
-                if resolved_target != resolved_executable {
-                    return Err(format!(
-                        "拒绝删除指向其他文件的软链接: {}",
-                        self.symlink_path.display()
-                    ));
-                }
-                fs::remove_file(&self.symlink_path).map_err(|e| io_context("删除软链接", e))?;
-                write_line(
-                    out,
-                    &format!("✅ 已删除软链接: {}", self.symlink_path.display()),
-                )
-            }
-        }
-    }
-
-    fn require_executable(&self) -> Result<(), String> {
-        if !self.executable.is_empty() {
-            return Ok(());
-        }
-        let executable = resolve_own_executable();
-        if executable.is_empty() {
-            return Err("获取可执行文件路径失败".to_string());
-        }
-        let info = fs::metadata(&executable).map_err(|e| io_context("获取可执行文件状态", e))?;
-        if info.is_dir() {
-            return Err(format!("可执行文件路径指向目录: {executable}"));
-        }
-        Ok(())
-    }
+/// 打印服务子命令用法(镜像 Go `printServiceUsage`)。
+pub(crate) fn print_service_usage(out: &mut dyn Write) -> Result<(), String> {
+    write_line(
+        out,
+        "用法: sv service <action>\n\n可用操作:\n  install   安装 sv 为系统服务\n  uninstall 卸载 sv 系统服务\n  start     启动 sv 系统服务\n  stop      停止 sv 系统服务\n  restart   重启 sv 系统服务\n  status    查看 sv 服务状态",
+    )
 }
 
 impl Default for ServiceManager {
@@ -352,148 +391,30 @@ impl Default for ServiceManager {
     }
 }
 
-/// 打印服务子命令用法(镜像 Go `printServiceUsage`)。
-fn print_service_usage(out: &mut dyn Write) -> Result<(), String> {
-    write_line(
-        out,
-        "用法: sv service <action>\n\n可用操作:\n  install   安装 sv 为系统服务\n  uninstall 卸载 sv 系统服务\n  start     启动 sv 系统服务\n  stop      停止 sv 系统服务\n  restart   重启 sv 系统服务\n  status    查看 sv 服务状态",
-    )
-}
-
-fn write_line(out: &mut dyn Write, text: &str) -> Result<(), String> {
+pub(crate) fn write_line(out: &mut dyn Write, text: &str) -> Result<(), String> {
     out.write_all(text.as_bytes())
         .and_then(|_| out.write_all(b"\n"))
         .map_err(|e| io_context("写入服务输出", e))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 在临时目录内生成一个真实可执行文件(镜像 std::env::current_exe 解析结果),
-    /// 避免 canonicalize 指向不存在的路径。
-    fn real_executable(dir: &Path) -> String {
-        let bin = dir.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let file = bin.join("sv-real");
-        fs::write(&file, "#!/bin/sh\n").unwrap();
-        fs::canonicalize(&file)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    fn temp_manager(backend: ServiceBackend) -> (tempfile::TempDir, ServiceManager, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let executable = real_executable(dir.path());
-        let symlink = PathBuf::from(dir.path()).join("bin").join("sv");
-        let unit = dir
-            .path()
-            .join("systemd")
-            .join(format!("{SERVICE_NAME}.service"));
-        let script = dir.path().join("init.d").join(SERVICE_NAME);
-        let manager =
-            ServiceManager::for_testing(executable, symlink.clone(), unit, script, backend);
-        (dir, manager, symlink)
-    }
-
-    fn capture(out: &mut Vec<u8>) -> &mut dyn Write {
-        out
-    }
-
-    #[test]
-    fn test_usage_and_unknown_operation() {
-        let (_dir, manager, _) = temp_manager(ServiceBackend::SysV);
-        let mut out = Vec::new();
-        let error = manager.handle_command(&[], capture(&mut out)).unwrap_err();
-        assert_eq!(error, "缺少服务操作");
-        assert!(String::from_utf8_lossy(&out).contains("用法: sv service <action>"));
-
-        let mut out = Vec::new();
-        let error = manager
-            .handle_command(
-                &["install".to_string(), "extra".to_string()],
-                capture(&mut out),
-            )
-            .unwrap_err();
-        assert_eq!(error, "服务操作不接受额外参数: extra");
-
-        let mut out = Vec::new();
-        let error = manager
-            .handle_command(&["bogus".to_string()], capture(&mut out))
-            .unwrap_err();
-        assert_eq!(error, "未知服务操作: bogus");
-    }
-
-    #[test]
-    fn test_install_uninstall_sysv_with_symlink() {
-        let (_dir, manager, symlink) = temp_manager(ServiceBackend::SysV);
-        let mut out = Vec::new();
-
-        manager.install(capture(&mut out)).unwrap();
-        let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("✅ SV 系统服务安装成功"), "{text}");
-        assert!(manager.init_script_path.exists());
-        assert!(symlink.symlink_metadata().unwrap().file_type().is_symlink());
-
-        let mut out = Vec::new();
-        manager.uninstall(capture(&mut out)).unwrap();
-        assert!(!manager.init_script_path.exists());
-        assert!(!symlink.exists());
-    }
-
-    #[test]
-    fn test_sysv_script_runs_and_status() {
-        let (_dir, manager, _) = temp_manager(ServiceBackend::SysV);
-        manager.write_init_script().unwrap();
-        // 直接运行脚本(真实进程)验证可执行与 stop 幂等。
-        let outcome = run_command(
-            manager.init_script_path.to_str().unwrap(),
-            &["status".to_string()],
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        assert_eq!(outcome.code, Some(3));
-        assert!(outcome.stdout_text().contains("not running"));
-    }
-
-    #[test]
-    fn test_symlink_refuses_non_symlink() {
-        let dir = tempfile::tempdir().unwrap();
-        let executable = real_executable(dir.path());
-        // 占用软链接路径写入一个普通文件。
-        let symlink = dir.path().join("occupied");
-        fs::write(&symlink, "plain file").unwrap();
-        let manager = ServiceManager::for_testing(
-            executable,
-            symlink,
-            dir.path().join("unit.service"),
-            dir.path().join("init"),
-            ServiceBackend::SysV,
-        );
-        let mut out = Vec::new();
-        let error = manager.create_symlink(capture(&mut out)).unwrap_err();
-        assert!(error.contains("目标路径已存在且不是软链接"), "{error}");
-    }
-
-    #[test]
-    fn test_remove_symlink_refuses_foreign() {
-        let dir = tempfile::tempdir().unwrap();
-        let executable = real_executable(dir.path());
-        let symlink = dir.path().join("sv");
-        let manager = ServiceManager::for_testing(
-            executable,
-            symlink.clone(),
-            dir.path().join("unit.service"),
-            dir.path().join("init"),
-            ServiceBackend::SysV,
-        );
-        // 软链接指向真实可执行文件以外的文件,应拒绝删除。
-        let other = dir.path().join("other");
-        fs::write(&other, "x").unwrap();
-        make_symlink(&other, &symlink).unwrap();
-        let mut out = Vec::new();
-        let error = manager.remove_symlink(capture(&mut out)).unwrap_err();
-        assert!(error.contains("拒绝删除指向其他文件的软链接"), "{error}");
-    }
+/// 返回路径的 symlink 元数据(不跟随软链);不存在返回 None。
+pub(crate) fn path_lstat(path: &Path) -> Option<std::fs::Metadata> {
+    fs::symlink_metadata(path).ok()
 }
+
+/// 把软链目标的原始文本解析成绝对化、规范化的路径,允许目标已删除(dangling)。
+pub(crate) fn resolve_link_target(link: &Path, target: &Path) -> PathBuf {
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link.parent().unwrap_or(Path::new(".")).join(target)
+    };
+    clean_path(&joined)
+}
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;
+
+#[path = "service_links.rs"]
+mod service_links;
