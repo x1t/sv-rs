@@ -7,10 +7,10 @@ sv - Supervisor进程管理工具
   sv start <进程>              # 启动进程
   sv stop <进程>               # 停止进程
   sv restart <进程>            # 重启进程
+  sv init                      # 初始化并启动 Supervisor RPC
   sv configure rpc             # 检查并补齐 RPC 配置
   sv configure rpc --dry-run   # 只预览配置变更
   sv configure rpc --restart   # 配置后显式重启 Supervisor
-  sv service uninstall         # 清理旧版 sv 常驻服务资产
 
 进程参数支持:
   序号      sv restart 1

@@ -9,7 +9,6 @@ use crate::client::RpcClient;
 use crate::config::ConfigDetector;
 use crate::parse::{ProcessInfo, action_icon, color_by_state};
 use crate::render::{NO_PROCESSES_TEXT, render_table};
-use crate::service::LegacyServiceCleanup;
 use crate::spec;
 use crate::util::io_context;
 
@@ -23,10 +22,10 @@ const USAGE: &str = "sv - Supervisor进程管理工具
   sv start <进程>              # 启动进程
   sv stop <进程>               # 停止进程
   sv restart <进程>            # 重启进程
+  sv init                      # 初始化并启动 Supervisor RPC
   sv configure rpc             # 检查并补齐 RPC 配置
   sv configure rpc --dry-run   # 只预览配置变更
   sv configure rpc --restart   # 配置后显式重启 Supervisor
-  sv service uninstall         # 清理旧版 sv 常驻服务资产
 
 进程参数支持:
   序号      sv restart 1
@@ -176,6 +175,14 @@ fn configure(args: &[String], out: &mut dyn Write) -> Result<(), String> {
     Ok(())
 }
 
+/// 一次性准备并启动 Supervisor 的 RPC 服务；sv 本身不常驻。
+fn init_supervisor(out: &mut dyn Write) -> Result<(), String> {
+    let detector = ConfigDetector::new();
+    let message = detector.initialize_supervisor()?;
+    write_text(out, &message)?;
+    write_text(out, "\n✅ Supervisor RPC 初始化成功\n")
+}
+
 /// 按参数分发命令(镜像 Go `app.RunArgs`)。
 pub fn run(args: &[String], out: &mut dyn Write, color: bool) -> Result<(), String> {
     if args.is_empty() {
@@ -186,12 +193,13 @@ pub fn run(args: &[String], out: &mut dyn Write, color: bool) -> Result<(), Stri
     let command_args = &args[1..];
     match command.as_str() {
         "help" | "-h" | "--help" => print_usage(out),
-        "service" => LegacyServiceCleanup::new().handle_command(command_args, out),
+        "init" => {
+            if !command_args.is_empty() {
+                return Err("init不接受额外参数".to_string());
+            }
+            init_supervisor(out)
+        }
         "configure" => configure(command_args, out),
-        "daemon" => Err(
-            "sv-rs 不需要常驻运行，请直接使用 status/start/stop/restart 控制 Supervisor"
-                .to_string(),
-        ),
         "status" | "list" | "ls" => {
             if !command_args.is_empty() {
                 return Err(format!("{command}不接受额外参数"));
@@ -264,33 +272,23 @@ mod tests {
     }
 
     #[test]
-    fn test_removed_daemon_reports_cli_guidance() {
-        let (result, out) = run_capture(&["daemon"]);
-        assert_eq!(
-            result.unwrap_err(),
-            "sv-rs 不需要常驻运行，请直接使用 status/start/stop/restart 控制 Supervisor"
-        );
+    fn test_init_rejects_extra_args() {
+        let (result, out) = run_capture(&["init", "extra"]);
+        assert_eq!(result.unwrap_err(), "init不接受额外参数");
         assert!(out.is_empty());
     }
 
     #[test]
-    fn test_legacy_service_cleanup_usage_and_removed_actions() {
-        let (result, out) = run_capture(&["service"]);
-        assert_eq!(result.unwrap_err(), "缺少服务操作");
-        assert!(out.contains("sv service uninstall"));
-
-        let (result, out) = run_capture(&["service", "bogus"]);
-        assert_eq!(result.unwrap_err(), "未知服务操作: bogus");
-        assert!(out.contains("sv service uninstall"));
-
-        let (result, _) = run_capture(&["service", "install"]);
-        assert_eq!(
-            result.unwrap_err(),
-            "sv-rs 不需要常驻运行或安装为系统服务，请直接安装二进制并使用 status/start/stop/restart"
-        );
-
-        let (result, _) = run_capture(&["service", "uninstall", "extra"]);
-        assert_eq!(result.unwrap_err(), "服务操作不接受额外参数: extra");
+    fn test_removed_service_commands_are_unknown() {
+        for args in [
+            &["service", "install"][..],
+            &["service", "uninstall"][..],
+            &["daemon"][..],
+        ] {
+            let (result, out) = run_capture(args);
+            assert!(result.is_err(), "args={args:?}");
+            assert!(out.contains("sv init"), "args={args:?}");
+        }
     }
 
     #[test]

@@ -216,12 +216,21 @@ fn e2e_list_with_extra_args_matches_golden() {
 }
 
 #[test]
-fn e2e_service_command_argument_errors() {
-    let output = run_bin(&["service", "install", "extra"]);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(error.trim_end(), "❌ 服务操作不接受额外参数: extra");
+fn e2e_removed_service_commands_are_unknown() {
+    for args in [
+        &["service", "install"][..],
+        &["service", "uninstall"][..],
+        &["daemon"][..],
+    ] {
+        let output = run_bin(args);
+        assert_eq!(output.status.code(), Some(1), "args={args:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("sv init"));
+        let expected = format!("未知命令: {}", args[0]);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&expected),
+            "args={args:?}"
+        );
+    }
 }
 
 #[test]

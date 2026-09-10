@@ -6,8 +6,6 @@ mod client_map;
 mod config;
 mod parse;
 mod render;
-mod service;
-mod service_files;
 mod spec;
 mod util;
 mod xmlrpc;

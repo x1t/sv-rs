@@ -119,6 +119,15 @@ impl ConfigDetector {
         ))
     }
 
+    /// 一次性补齐 RPC 配置并重启已有的 Supervisor 服务。
+    /// sv-rs 自身不创建、启动或管理后台服务。
+    pub fn initialize_supervisor(&self) -> Result<String, String> {
+        let message = self.configure_rpc(false)?;
+        self.restart_supervisor()
+            .map_err(|error| format!("初始化 Supervisor RPC 失败: {error}"))?;
+        Ok(message)
+    }
+
     /// 检查配置文件是否包含 inet_http_server.port 有效配置。
     #[cfg(test)]
     pub fn has_inet_http_server(&self, config_path: &str) -> Result<bool, String> {
