@@ -28,10 +28,6 @@ sv-rs/
 │   ├── config.rs        # 配置检测与自动补齐
 │   ├── render.rs        # 确定性表格渲染
 │   ├── parse.rs         # 进程数据模型与纯文本解析
-│   ├── service.rs       # 旧版常驻服务资产清理兼容入口
-│   ├── service_cleanup.rs # 跨后端旧资产卸载与预检
-│   ├── service_links.rs # 命令软链接归属校验与删除
-│   ├── service_files.rs # 旧 unit/init 文本解析与链接清理
 │   ├── spec.rs          # 动作/参数校验
 │   ├── util.rs          # 命令执行等工具
 │   └── xmlrpc.rs        # XML-RPC 编解码
@@ -58,8 +54,29 @@ cargo install --locked cargo-zigbuild  # 并安装 zig，见 build.sh 顶部说�
 ./build.sh                             # 默认构建 amd64 + arm64
 ./build.sh x86_64-unknown-linux-musl   # 或只构建指定目标
 
-sudo install -m 0755 dist/sv-rs-linux-amd64 /usr/local/bin/sv-rs
-sudo ln -s /usr/local/bin/sv-rs /usr/local/bin/sv
+sudo install -m 0755 dist/sv-rs-linux-amd64 /usr/local/bin/sv
+```
+
+### 从 GitHub Release 安装
+
+下面的命令会根据当前 Linux 架构下载最新 Release，并将本地二进制安装为 `sv`：
+
+```bash
+set -eu
+arch="$(case "$(uname -m)" in
+  x86_64|amd64) printf '%s' amd64 ;;
+  aarch64|arm64) printf '%s' arm64 ;;
+  *) printf '不支持的架构: %s\n' "$(uname -m)" >&2; exit 1 ;;
+esac)"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' 0
+curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
+  "https://github.com/x1t/sv-rs/releases/latest/download/sv-rs-linux-${arch}" -o "$tmp"
+if [ "$(id -u)" -eq 0 ]; then
+  install -m 0755 "$tmp" /usr/local/bin/sv
+else
+  sudo install -m 0755 "$tmp" /usr/local/bin/sv
+fi
 ```
 
 ## 📖 基本使用
@@ -72,12 +89,13 @@ sv-rs stop 2 4 6              # 停止序号 2、4、6
 sv-rs start 1-3               # 启动序号 1~3
 sv-rs restart nginx redis     # 用进程名操作
 sv-rs restart 1 nginx 3-5     # 混合格式
+sv-rs init                    # 初始化并启动 Supervisor RPC
 sv-rs configure rpc           # 检测并补齐 RPC 配置
 sv-rs configure rpc --dry-run # 预览配置变更
 ```
 
-`status/start/stop/restart` 都是一次性控制命令。它们连接 Supervisor RPC 服务端，命令完成
-后进程退出，不需要由 systemd 或 SysV 管理 `sv-rs`。
+`init/status/start/stop/restart` 都是一次性控制命令。它们连接或初始化 Supervisor RPC
+服务端，命令完成后进程退出，不需要由 systemd、SysV 或 OpenWrt init 管理 `sv-rs`。
 
 ## 🔧 Supervisor 配置
 
@@ -90,34 +108,21 @@ export SUPERVISOR_CONFIG="/etc/supervisor/supervisord.conf"
 export SUPERVISOR_TIMEOUT="300"
 ```
 
-也可以让工具检查并补齐本地 RPC 配置：
+也可以预览并应用本地 RPC 配置：
 
 ```bash
-sudo sv-rs configure rpc
-sudo sv-rs configure rpc --restart
+sv-rs configure rpc --dry-run
+sudo sv-rs init
 ```
 
 Supervisor 的常驻服务仍应由系统原有的 `supervisord.service`、`supervisor.service` 或
-对应的 SysV 服务管理。`sv-rs configure rpc --restart` 也只会尝试重启这些 Supervisor 服务。
+对应的 SysV/OpenWrt 服务管理。`sv-rs init` 只会初始化 RPC 配置并重启这些 Supervisor 服务。
 
-## ♻️ 旧版本迁移与卸载
+## 🔄 Supervisor初始化
 
-历史版本曾提供 `sv service install`，可能留下 `sv-supervisor-manager` 的 systemd/SysV
-服务文件和 `/usr/local/bin/sv` 链接。当前版本不再安装或启动该空壳服务，但暂时保留：
-
-```bash
-sudo sv-rs service uninstall
-```
-
-该命令只清理能够证明属于旧版 sv-rs 的 unit/init 文件、启动链接和命令软链接；遇到异源
-文件、普通文件或归属不明确的软链接会拒绝操作。服务清理是幂等的，可重复执行。
-
-升级时建议先用旧版本执行 `sudo sv service uninstall`，再替换二进制；如果旧二进制已经被
-移除，可使用新版本的 `sudo sv-rs service uninstall` 清理残留。不要把 `sv-rs daemon` 加入
-systemd/SysV：它已被移除，且 sv-rs 本身不需要常驻运行。
-
-`cargo uninstall sv-rs` 只会移除 Cargo 安装的二进制，不会删除系统服务资产或命令软链接；
-卸载 Cargo 二进制前请先完成旧服务清理。
+`sv-rs init` 是一次性初始化命令：它补齐本地配置中的 RPC listener 和标准 RPC 接口，
+调用系统已有的 Supervisor 服务使配置生效，然后退出。systemd、SysV 或 OpenWrt init/procd
+只负责 `supervisord`，不负责 `sv-rs`。
 
 ## 🧪 测试
 
