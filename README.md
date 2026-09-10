@@ -63,20 +63,20 @@ sudo install -m 0755 dist/sv-rs-linux-amd64 /usr/local/bin/sv
 将二进制安装为 `/usr/local/bin/sv`。两个版本使用相同安装路径，请选择其中一个。
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/x1t/sv-rs/refs/heads/refactor/remove-sv-daemon-service/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/x1t/sv-rs/refs/heads/main/install.sh | sh
 ```
 
 指定已发布版本或安装目录：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/x1t/sv-rs/refs/heads/refactor/remove-sv-daemon-service/install.sh | sh -s -- --version v0.3.0 --install-dir /usr/bin
+curl -fsSL https://raw.githubusercontent.com/x1t/sv-rs/refs/heads/main/install.sh | sh -s -- --version v0.3.0 --install-dir /usr/bin
 ```
 
 脚本支持 `curl` / `wget` 下载以及 `SV_VERSION`、`SV_INSTALL_DIR` 环境变量。
 安装目录须已存在；没有写权限时会尝试 `sudo`，OpenWrt 可直接以 root 执行。
 安装只复制二进制，不会启动 Supervisor；安装后使用 `sv --help`。
 
-脚本链接当前指向 `refactor/remove-sv-daemon-service` 分支；Release 二进制仍来自最新正式发布。
+脚本链接指向 `main` 分支；Release 二进制来自最新正式发布。
 
 ## 📖 基本使用
 
